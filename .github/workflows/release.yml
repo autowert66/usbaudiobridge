@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag. Leave blank to derive v<versionName>-<short sha>.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build APK + KernelSU module and publish
+    runs-on: ubuntu-latest
+    env:
+      JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF8
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            .gradle
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          SDKMANAGER="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "${SDKMANAGER}" --sdk_root="${ANDROID_SDK_ROOT}" --licenses >/dev/null 2>&1 || true
+          "${SDKMANAGER}" --sdk_root="${ANDROID_SDK_ROOT}" \
+            "platform-tools" "platforms;android-36" "build-tools;36.0.0" || true
+          "${SDKMANAGER}" --sdk_root="${ANDROID_SDK_ROOT}" "ndk;29.0.14206865" "cmake;3.22.1" \
+            || echo "NDK/CMake not installed via sdkmanager; relying on Gradle SDK auto-download."
+
+      - name: Configure release signing
+        shell: bash
+        run: |
+          set -e
+          if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+            {
+              echo "storeFile=release.keystore"
+              echo "storePassword=${{ secrets.RELEASE_STORE_PASSWORD }}"
+              echo "keyAlias=${{ secrets.RELEASE_KEY_ALIAS }}"
+              echo "keyPassword=${{ secrets.RELEASE_KEY_PASSWORD }}"
+            } > key.properties
+            echo "Signing with the keystore from repository secrets."
+          else
+            {
+              echo "storeFile=debug.keystore"
+              echo "storePassword=android"
+              echo "keyAlias=androiddebugkey"
+              echo "keyPassword=android"
+            } > key.properties
+            echo "No keystore secrets configured; signing with the bundled debug keystore."
+          fi
+
+      - name: Resolve version and tag
+        id: vars
+        shell: bash
+        run: |
+          set -e
+          VN=$(grep -oE 'versionName[[:space:]]*=[[:space:]]*"[^"]+"' app/build.gradle.kts | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          [ -n "$VN" ] || VN=0.0.0
+          SHORT=$(git rev-parse --short HEAD)
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              TAG="${GITHUB_REF_NAME}"
+            else
+              TAG="v${VN}-${SHORT}"
+            fi
+          fi
+          echo "version=$VN" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG (version $VN)"
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Assemble release assets
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist
+          APK=$(find app/build/outputs/apk/release -type f -name '*.apk' | head -n1)
+          if [ -z "$APK" ]; then
+            echo "No release APK produced" >&2
+            exit 1
+          fi
+          cp "$APK" "dist/UsbAudioBridge-${{ steps.vars.outputs.version }}-release.apk"
+          ( cd ksu-module && zip -r "../dist/usbaudiobridge_selinux.zip" module.prop sepolicy.rule uninstall.sh )
+          ls -l dist
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ steps.vars.outputs.tag }}"
+          VN="${{ steps.vars.outputs.version }}"
+          cat > release-notes.md <<EOF
+          UsbAudioBridge $VN release build.
+
+          Assets:
+          - \`UsbAudioBridge-$VN-release.apk\` - installable release APK
+          - \`usbaudiobridge_selinux.zip\` - KernelSU / KernelSU-Next module granting the app access to the USB gadget ALSA device (see ksu-module/README.md)
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --notes-file release-notes.md
+          fi

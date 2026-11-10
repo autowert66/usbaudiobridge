@@ -1,0 +1,4 @@
+typeattribute audio_device mlstrustedobject
+allow untrusted_app_34 audio_device chr_file { read write open ioctl getattr map }
+allow untrusted_app_34 audio_device dir { search getattr read open }
+allow untrusted_app_34 cgroup dir { search getattr read open }

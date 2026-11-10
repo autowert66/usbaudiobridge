@@ -1,0 +1,5 @@
+id=usbaudiobridge_selinux
+name=UsbAudioBridge SELinux Policy
+version=1.0.0
+versionCode=1
+description=Grants UsbAudioBridge access to the USB gadget ALSA device /dev/snd so the native bridge can open the gadget PCM.
